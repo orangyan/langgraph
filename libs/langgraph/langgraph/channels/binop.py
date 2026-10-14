@@ -2,6 +2,7 @@ import collections.abc
 from collections.abc import Callable, Sequence
 from typing import Any, Generic
 
+from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from typing_extensions import NotRequired, Required, Self
 
 from langgraph._internal._constants import OVERWRITE
@@ -29,11 +30,25 @@ def _strip_extras(t):  # type: ignore[no-untyped-def]
 
 
 def _get_overwrite(value: Any) -> tuple[bool, Any]:
-    """Inspects the given value and returns (is_overwrite, overwrite_value)."""
+    """Inspects the given value and returns (is_overwrite, overwrite_value).
+
+    Recognises three forms:
+
+    * The typed `Overwrite` dataclass instance.
+    * The sentinel-keyed `{"__overwrite__": value}` dict form.
+    * The dataclass-erased `{"value": ..., "type": "__overwrite__"}` form that
+      results from JSON-serialising an `Overwrite` (e.g. an `orjson`-encoded
+      state update routed through the LangGraph API server). This keeps the
+      `Overwrite` semantics intact across JSON boundaries that strip dataclass
+      types.
+    """
     if isinstance(value, Overwrite):
         return True, value.value
-    if isinstance(value, dict) and len(value) == 1 and OVERWRITE in value:
-        return True, value[OVERWRITE]
+    if isinstance(value, dict):
+        if len(value) == 1 and OVERWRITE in value:
+            return True, value[OVERWRITE]
+        if value.get("type") == OVERWRITE and "value" in value:
+            return True, value["value"]
     return False, None
 
 
@@ -102,6 +117,9 @@ class BinaryOperatorAggregate(Generic[Value], BaseChannel[Value, Value, Value]):
     def from_checkpoint(self, checkpoint: Value) -> Self:
         empty = self.__class__(self.typ, self.operator)
         empty.key = self.key
+        # A thread written while this field was a DeltaChannel stores snapshots.
+        if isinstance(checkpoint, _DeltaSnapshot):
+            checkpoint = checkpoint.value
         if checkpoint is not MISSING:
             empty.value = checkpoint
         return empty

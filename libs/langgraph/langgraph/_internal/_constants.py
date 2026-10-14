@@ -23,6 +23,9 @@ RETURN = sys.intern("__return__")
 # for writes of a task where we simply record the return value
 PREVIOUS = sys.intern("__previous__")
 # the implicit branch that handles each node's Control values
+SNAPSHOT_BUMPS = sys.intern("__snapshot_bumps__")
+# `versions_seen` key recording which entries a snapshot-only version bump
+# advanced, and the versions those nodes really read
 
 
 # --- Reserved cache namespaces ---
@@ -95,6 +98,15 @@ NULL_TASK_ID = sys.intern("00000000-0000-0000-0000-000000000000")
 OVERWRITE = sys.intern("__overwrite__")
 # dict key for the overwrite value, used as `{'__overwrite__': value}`
 
+# Checkpoint coordinate keys: when any of these appear in an explicit
+# configurable, the caller is addressing its own checkpoint lineage.
+_CHECKPOINT_COORDINATE_KEYS = (
+    CONFIG_KEY_THREAD_ID,
+    CONFIG_KEY_CHECKPOINT_NS,
+    CONFIG_KEY_CHECKPOINT_ID,
+    CONFIG_KEY_CHECKPOINT_MAP,
+)
+
 # redefined to avoid circular import with langgraph.constants
 _TAG_HIDDEN = sys.intern("langsmith:hidden")
 
@@ -107,6 +119,7 @@ RESERVED = {
     ERROR,
     ERROR_SOURCE_NODE,
     NO_WRITES,
+    SNAPSHOT_BUMPS,
     # reserved config.configurable keys
     CONFIG_KEY_SEND,
     CONFIG_KEY_READ,

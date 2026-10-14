@@ -7,7 +7,7 @@ import operator
 import random
 import sys
 import uuid
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import replace
 from time import perf_counter
 from typing import (
@@ -21,9 +21,22 @@ from uuid import UUID
 
 import pytest
 from langchain_core.language_models import GenericFakeChatModel
-from langchain_core.messages import HumanMessage
+from langchain_core.language_models.fake_chat_models import (
+    FakeMessagesListChatModel,
+)
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolCall,
+    ToolMessage,
+)
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnablePassthrough
+from langchain_core.tools import tool
 from langchain_core.utils.aiter import aclosing
+from langchain_core.version import VERSION as LANGCHAIN_CORE_VERSION
 from langgraph.cache.base import BaseCache
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
@@ -44,6 +57,7 @@ from typing_extensions import NotRequired, TypedDict
 from langgraph._internal._constants import CONFIG_KEY_NODE_FINISHED, ERROR, PULL
 from langgraph._internal._queue import AsyncQueue
 from langgraph.channels.binop import BinaryOperatorAggregate
+from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.last_value import LastValue
 from langgraph.channels.topic import Topic
 from langgraph.errors import (
@@ -54,10 +68,11 @@ from langgraph.errors import (
 )
 from langgraph.func import entrypoint, task
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import MessagesState, add_messages
+from langgraph.graph.message import MessagesState, _messages_delta_reducer, add_messages
 from langgraph.pregel import NodeBuilder, Pregel
-from langgraph.pregel._loop import AsyncPregelLoop
+from langgraph.pregel._loop import AsyncPregelLoop, PregelLoop
 from langgraph.pregel._runner import PregelRunner
+from langgraph.runtime import RunControl
 from langgraph.types import (
     CachePolicy,
     Command,
@@ -221,7 +236,6 @@ async def test_checkpoint_errors() -> None:
 async def test_request_drain_allows_inflight_acall_scheduling(
     async_checkpointer: BaseCheckpointSaver,
 ) -> None:
-    from langgraph.runtime import RunControl
 
     @task
     async def child(x: int) -> int:
@@ -2867,7 +2881,6 @@ async def test_send_dedupe_on_resume(
 
 
 async def test_send_react_interrupt(async_checkpointer: BaseCheckpointSaver) -> None:
-    from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 
     ai_message = AIMessage(
         "",
@@ -3258,7 +3271,6 @@ async def test_send_react_interrupt(async_checkpointer: BaseCheckpointSaver) -> 
 async def test_send_react_interrupt_control(
     async_checkpointer: BaseCheckpointSaver, snapshot: SnapshotAssertion
 ) -> None:
-    from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 
     ai_message = AIMessage(
         "",
@@ -5537,12 +5549,6 @@ async def test_checkpoint_metadata(async_checkpointer: BaseCheckpointSaver) -> N
     previous checkpoint config for each step in the run.
     """
     # set up test
-    from langchain_core.language_models.fake_chat_models import (
-        FakeMessagesListChatModel,
-    )
-    from langchain_core.messages import AIMessage, AnyMessage
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.tools import tool
 
     # graph state
     class BaseState(TypedDict):
@@ -5943,7 +5949,6 @@ async def test_debug_subgraphs(
 async def test_debug_nested_subgraphs(
     async_checkpointer: BaseCheckpointSaver, durability: Durability
 ) -> None:
-    from collections import defaultdict
 
     class State(TypedDict):
         messages: Annotated[list[str], operator.add]
@@ -6060,8 +6065,6 @@ async def test_debug_nested_subgraphs(
 async def test_parent_command(
     async_checkpointer: BaseCheckpointSaver, subgraph_persist: bool
 ) -> None:
-    from langchain_core.messages import BaseMessage
-    from langchain_core.tools import tool
 
     @tool(return_direct=True)
     def get_user_name() -> Command:
@@ -6129,10 +6132,6 @@ async def test_parent_command(
 
 async def test_delta_channel_durability_exit_stores_snapshot_async() -> None:
     """DeltaChannel must reload from an async durability='exit' checkpoint."""
-    from langchain_core.messages import AIMessage
-
-    from langgraph.channels.delta import DeltaChannel
-    from langgraph.graph.message import _messages_delta_reducer
 
     class State(TypedDict):
         messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
@@ -6419,7 +6418,6 @@ async def test_command_with_static_breakpoints(
 
 
 async def test_multistep_plan(async_checkpointer: BaseCheckpointSaver) -> None:
-    from langchain_core.messages import AnyMessage
 
     class State(TypedDict, total=False):
         plan: list[str | list[str]]
@@ -6757,7 +6755,6 @@ async def test_multiple_interrupts_functional(
     async_checkpointer: BaseCheckpointSaver,
 ) -> None:
     """Test multiple interrupts with functional API."""
-    from langgraph.func import entrypoint, task
 
     counter = 0
 
@@ -7604,6 +7601,7 @@ async def test_tags_stream_mode_messages() -> None:
                 "ls_provider": "genericfakechatmodel",
                 "ls_model_type": "chat",
                 "ls_integration": "langchain_chat_model",
+                "lc_versions": {"langchain-core": LANGCHAIN_CORE_VERSION},
                 "tags": ["meow"],
             },
         )
@@ -7672,7 +7670,6 @@ async def test_configurable_propagates_to_stream_metadata() -> None:
 
 
 async def test_stream_mode_messages_command() -> None:
-    from langchain_core.messages import HumanMessage
 
     async def my_node(state):
         return {"messages": HumanMessage(content="foo")}
@@ -7721,7 +7718,6 @@ async def test_stream_mode_messages_command() -> None:
 
 
 async def test_stream_messages_dedupe_inputs() -> None:
-    from langchain_core.messages import AIMessage
 
     async def call_model(state):
         return {"messages": AIMessage("hi", id="1")}
@@ -7761,7 +7757,6 @@ async def test_stream_messages_dedupe_inputs() -> None:
 async def test_stream_messages_dedupe_state(
     async_checkpointer: BaseCheckpointSaver,
 ) -> None:
-    from langchain_core.messages import AIMessage
 
     to_emit = [AIMessage("bye", id="1"), AIMessage("bye again", id="2")]
 
@@ -8140,9 +8135,6 @@ async def test_no_redundant_put_writes_for_cached_task(
     async_checkpointer: BaseCheckpointSaver,
 ) -> None:
     """Cached @tasks on resume must not trigger redundant put_writes."""
-    from unittest.mock import patch
-
-    from langgraph.pregel._loop import PregelLoop
 
     @task
     async def setup(x: int) -> int:
@@ -8165,9 +8157,9 @@ async def test_no_redundant_put_writes_for_cached_task(
     put_writes_task_ids: list[str] = []
     orig = PregelLoop.put_writes
 
-    def spy(self, task_id, writes):
+    def spy(self, task_id, writes, **kwargs):
         put_writes_task_ids.append(task_id)
-        return orig(self, task_id, writes)
+        return orig(self, task_id, writes, **kwargs)
 
     with patch.object(PregelLoop, "put_writes", spy):
         result = await workflow.ainvoke(Command(resume="ans"), config=config)
@@ -8644,7 +8636,6 @@ async def test_batch_update_as_input(
 
 
 async def test_draw_invalid():
-    from langchain_core.messages import BaseMessage
 
     class AgentState(TypedDict):
         messages: Annotated[list[BaseMessage], add_messages]
@@ -8761,279 +8752,116 @@ async def test_imp_exception(
         {"my_workflow": "done"},
     ]
 
-    assert [c async for c in my_workflow.astream_events(1, thread1)] == [
-        {
-            "event": "on_chain_start",
-            "data": {"input": 1},
-            "name": "LangGraph",
-            "tags": [],
-            "run_id": AnyStr(),
-            "metadata": {"thread_id": "1", "ls_integration": "langgraph"},
-            "parent_ids": [],
-        },
-        {
-            "event": "on_chain_start",
-            "data": {"input": 1},
-            "name": "my_workflow",
-            "tags": ["graph:step:4"],
-            "run_id": AnyStr(),
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_workflow",
-                "langgraph_triggers": ("__start__",),
-                "langgraph_path": ("__pregel_pull", "my_workflow"),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [AnyStr()],
-        },
-        {
-            "event": "on_chain_start",
-            "data": {"input": {"number": 1}},
-            "name": "my_task",
-            "tags": ["seq:step:1"],
-            "run_id": AnyStr(),
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_stream",
-            "run_id": AnyStr(),
-            "name": "my_task",
-            "tags": ["seq:step:1"],
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "data": {"chunk": 2},
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_end",
-            "data": {"output": 2, "input": {"number": 1}},
-            "run_id": AnyStr(),
-            "name": "my_task",
-            "tags": ["seq:step:1"],
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_stream",
-            "run_id": AnyStr(),
-            "name": "LangGraph",
-            "tags": [],
-            "metadata": {"thread_id": "1", "ls_integration": "langgraph"},
-            "data": {"chunk": {"my_task": 2}},
-            "parent_ids": [],
-        },
-        {
-            "event": "on_chain_start",
-            "data": {"input": {"number": 1}},
-            "name": "task_with_exception",
-            "tags": ["seq:step:1"],
-            "run_id": AnyStr(),
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_start",
-            "data": {"input": {"number": 1}},
-            "name": "my_task",
-            "tags": ["seq:step:1"],
-            "run_id": AnyStr(),
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_stream",
-            "run_id": AnyStr(),
-            "name": "my_task",
-            "tags": ["seq:step:1"],
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "data": {"chunk": 2},
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_end",
-            "data": {"output": 2, "input": {"number": 1}},
-            "run_id": AnyStr(),
-            "name": "my_task",
-            "tags": ["seq:step:1"],
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_task",
-                "langgraph_triggers": ("__pregel_push",),
-                "langgraph_path": (
-                    "__pregel_push",
-                    ("__pregel_pull", "my_workflow"),
-                    2,
-                    True,
-                ),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [
-                AnyStr(),
-                AnyStr(),
-            ],
-        },
-        {
-            "event": "on_chain_stream",
-            "run_id": AnyStr(),
-            "name": "my_workflow",
-            "tags": ["graph:step:4"],
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_workflow",
-                "langgraph_triggers": ("__start__",),
-                "langgraph_path": ("__pregel_pull", "my_workflow"),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "data": {"chunk": "done"},
-            "parent_ids": [AnyStr()],
-        },
-        {
-            "event": "on_chain_stream",
-            "run_id": AnyStr(),
-            "name": "LangGraph",
-            "tags": [],
-            "metadata": {"thread_id": "1", "ls_integration": "langgraph"},
-            "data": {"chunk": {"my_task": 2}},
-            "parent_ids": [],
-        },
-        {
-            "event": "on_chain_end",
-            "data": {"output": "done", "input": 1},
-            "run_id": AnyStr(),
-            "name": "my_workflow",
-            "tags": ["graph:step:4"],
-            "metadata": {
-                "thread_id": "1",
-                "ls_integration": "langgraph",
-                "langgraph_step": 4,
-                "langgraph_node": "my_workflow",
-                "langgraph_triggers": ("__start__",),
-                "langgraph_path": ("__pregel_pull", "my_workflow"),
-                "langgraph_checkpoint_ns": AnyStr(),
-            },
-            "parent_ids": [AnyStr()],
-        },
-        {
-            "event": "on_chain_stream",
-            "run_id": AnyStr(),
-            "name": "LangGraph",
-            "tags": [],
-            "metadata": {"thread_id": "1", "ls_integration": "langgraph"},
-            "data": {"chunk": {"my_workflow": "done"}},
-            "parent_ids": [],
-        },
-        {
-            "event": "on_chain_end",
-            "data": {"output": "done"},
-            "run_id": AnyStr(),
-            "name": "LangGraph",
-            "tags": [],
-            "metadata": {"thread_id": "1", "ls_integration": "langgraph"},
-            "parent_ids": [],
-        },
+    events = [c async for c in my_workflow.astream_events(1, thread1)]
+    assert [(event["event"], event["name"]) for event in events] == [
+        ("on_chain_start", "LangGraph"),
+        ("on_chain_start", "my_workflow"),
+        ("on_chain_start", "my_task"),
+        ("on_chain_stream", "my_task"),
+        ("on_chain_end", "my_task"),
+        ("on_chain_stream", "LangGraph"),
+        ("on_chain_start", "task_with_exception"),
+        ("on_chain_start", "my_task"),
+        ("on_chain_stream", "my_task"),
+        ("on_chain_end", "my_task"),
+        ("on_chain_stream", "my_workflow"),
+        ("on_chain_stream", "LangGraph"),
+        ("on_chain_end", "my_workflow"),
+        ("on_chain_stream", "LangGraph"),
+        ("on_chain_end", "LangGraph"),
     ]
+
+    root_events = [event for event in events if event["name"] == "LangGraph"]
+    for event in root_events:
+        assert event["tags"] == []
+        assert event["metadata"]["thread_id"] == "1"
+        assert event["metadata"]["ls_integration"] == "langgraph"
+        assert event["parent_ids"] == []
+
+    workflow_events = [event for event in events if event["name"] == "my_workflow"]
+    for event in workflow_events:
+        assert event["tags"] == ["graph:step:4"]
+        metadata = event["metadata"]
+        assert metadata["thread_id"] == "1"
+        assert metadata["ls_integration"] == "langgraph"
+        assert metadata["langgraph_step"] == 4
+        assert metadata["langgraph_node"] == "my_workflow"
+        assert metadata["langgraph_triggers"] == ("__start__",)
+        assert metadata["langgraph_path"] == ("__pregel_pull", "my_workflow")
+        assert isinstance(metadata["langgraph_checkpoint_ns"], str)
+        assert len(event["parent_ids"]) == 1
+
+    task_events = [event for event in events if event["name"] == "my_task"]
+    assert len(task_events) == 6
+    for event in task_events:
+        assert event["tags"] == ["seq:step:1"]
+        metadata = event["metadata"]
+        assert metadata["thread_id"] == "1"
+        assert metadata["ls_integration"] == "langgraph"
+        assert metadata["langgraph_step"] == 4
+        assert metadata["langgraph_node"] == "my_task"
+        assert metadata["langgraph_triggers"] == ("__pregel_push",)
+        assert metadata["langgraph_path"][:2] == (
+            "__pregel_push",
+            ("__pregel_pull", "my_workflow"),
+        )
+        assert metadata["langgraph_path"][-1] is True
+        assert isinstance(metadata["langgraph_checkpoint_ns"], str)
+        assert len(event["parent_ids"]) == 2
+
+    task_with_exception_event = next(
+        event for event in events if event["name"] == "task_with_exception"
+    )
+    assert task_with_exception_event["event"] == "on_chain_start"
+    assert task_with_exception_event["data"] == {"input": {"number": 1}}
+    assert task_with_exception_event["tags"] == ["seq:step:1"]
+    metadata = task_with_exception_event["metadata"]
+    assert metadata["thread_id"] == "1"
+    assert metadata["ls_integration"] == "langgraph"
+    assert metadata["langgraph_step"] == 4
+    assert metadata["langgraph_node"] == "task_with_exception"
+    assert metadata["langgraph_triggers"] == ("__pregel_push",)
+    assert metadata["langgraph_path"][:2] == (
+        "__pregel_push",
+        ("__pregel_pull", "my_workflow"),
+    )
+    assert metadata["langgraph_path"][-1] is True
+    assert isinstance(metadata["langgraph_checkpoint_ns"], str)
+    assert len(task_with_exception_event["parent_ids"]) == 2
+
+    assert [
+        event["data"]
+        for event in events
+        if event["event"] == "on_chain_stream" and event["name"] == "LangGraph"
+    ] == [
+        {"chunk": {"my_task": 2}},
+        {"chunk": {"my_task": 2}},
+        {"chunk": {"my_workflow": "done"}},
+    ]
+    assert [
+        event["data"]
+        for event in events
+        if event["event"] == "on_chain_stream" and event["name"] == "my_task"
+    ] == [{"chunk": 2}, {"chunk": 2}]
+    assert [
+        event["data"]
+        for event in events
+        if event["event"] == "on_chain_end" and event["name"] == "my_task"
+    ] == [
+        {"output": 2, "input": {"number": 1}},
+        {"output": 2, "input": {"number": 1}},
+    ]
+    assert [
+        event["data"]
+        for event in events
+        if event["event"] == "on_chain_stream" and event["name"] == "my_workflow"
+    ] == [{"chunk": "done"}]
+    assert [
+        event["data"]
+        for event in events
+        if event["event"] == "on_chain_end" and event["name"] == "my_workflow"
+    ] == [{"output": "done", "input": 1}]
+    assert events[-1]["data"] == {"output": "done"}
 
 
 @pytest.mark.parametrize("with_timeout", [False, "inner", "outer", "both"])

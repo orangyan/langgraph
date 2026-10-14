@@ -3,8 +3,10 @@ legacy v1 chunk filtering, and end-to-end via stream_events(version="v3") / astr
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from langchain_core.language_models import GenericFakeChatModel
@@ -12,12 +14,14 @@ from langchain_core.language_models.chat_model_stream import (
     AsyncChatModelStream,
     ChatModelStream,
 )
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_core.runnables import RunnableConfig
 from typing_extensions import TypedDict
 
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
+from langgraph.pregel._messages import StreamMessagesHandlerV2
 from langgraph.stream._mux import StreamMux
 from langgraph.stream.run_stream import GraphRunStream
 from langgraph.stream.stream_channel import StreamChannel
@@ -213,6 +217,23 @@ class TestProtocolEventRouting:
         log.close()
         assert _unstamped(log._items) == []
 
+    def test_tool_role_protocol_events_are_ignored(self) -> None:
+        t, log = _make_sync_transformer()
+        for evt in [
+            {"event": "message-start", "role": "tool", "message_id": "tool-msg-1"},
+            {
+                "event": "content-block-delta",
+                "index": 0,
+                "content_block": {"type": "text", "text": "[]"},
+            },
+            {"event": "message-finish", "reason": "stop"},
+        ]:
+            t.process(_proto_event(evt, run_id="tool-run"))
+
+        log.close()
+        assert _unstamped(log._items) == []
+        assert t._ignored_runs == set()
+
     def test_concurrent_streams_routed_by_run_id(self) -> None:
         t, log = _make_sync_transformer()
         life_a = _lifecycle(text="aaaa", message_id="run-a")
@@ -272,6 +293,29 @@ class TestWholeMessageFallback:
         (stream,) = _unstamped(log._items)
         assert stream.done
         assert stream.output.text == "the full answer"
+
+    def test_whole_tool_message_is_ignored(self) -> None:
+        t, log = _make_sync_transformer()
+        t.process(
+            {
+                "type": "event",
+                "method": "messages",
+                "params": {
+                    "namespace": [],
+                    "timestamp": TS,
+                    "data": (
+                        ToolMessage(
+                            content="[]",
+                            id="tool-msg-1",
+                            tool_call_id="call_1",
+                        ),
+                        {"langgraph_node": "tools"},
+                    ),
+                },
+            }
+        )
+        log.close()
+        assert _unstamped(log._items) == []
 
     def test_whole_message_has_full_lifecycle(self) -> None:
         t, log = _make_sync_transformer()
@@ -567,7 +611,6 @@ class TestEndToEnd:
     @pytest.mark.anyio
     async def test_nested_async_iteration_yields_text_deltas(self) -> None:
         """Inner stream.text drives the shared graph pump via the async pump binding."""
-        import asyncio
 
         model = GenericFakeChatModel(messages=iter(["hello world"]))
 
@@ -830,11 +873,6 @@ class TestDirectMessagesModeStaysV1:
 class TestStreamMessagesHandlerV2Unit:
     def test_on_llm_new_token_is_noop(self) -> None:
         """v2 handler must not emit v1 chunks even when on_llm_new_token fires."""
-        from uuid import uuid4
-
-        from langchain_core.outputs import ChatGenerationChunk
-
-        from langgraph.pregel._messages import StreamMessagesHandlerV2
 
         emitted: list[Any] = []
         handler = StreamMessagesHandlerV2(emitted.append, subgraphs=False)
@@ -849,14 +887,23 @@ class TestStreamMessagesHandlerV2Unit:
 
         assert emitted == []
 
+    def test_on_chain_end_does_not_emit_tool_messages(self) -> None:
+
+        emitted: list[Any] = []
+        handler = StreamMessagesHandlerV2(emitted.append, subgraphs=False)
+        run_id = uuid4()
+        handler.metadata[run_id] = ((), {"langgraph_node": "tools"})
+
+        handler.on_chain_end(
+            {"messages": [ToolMessage(content="[]", tool_call_id="call_1")]},
+            run_id=run_id,
+        )
+
+        assert emitted == []
+
     def test_on_llm_end_dedupes_when_final_message_id_differs(self) -> None:
         """A streamed v2 message should not be emitted again from the final
         AIMessage fallback when its final id does not match `message-start`."""
-        from uuid import uuid4
-
-        from langchain_core.outputs import ChatGeneration, LLMResult
-
-        from langgraph.pregel._messages import StreamMessagesHandlerV2
 
         emitted: list[Any] = []
         handler = StreamMessagesHandlerV2(emitted.append, subgraphs=False)

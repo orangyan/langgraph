@@ -10,6 +10,7 @@ from typing import (
     NamedTuple,
     TypedDict,
     TypeVar,
+    cast,
 )
 
 from langchain_core.runnables import RunnableConfig
@@ -60,20 +61,29 @@ class CheckpointMetadata(TypedDict, total=False):
     """
     run_id: str
     """The ID of the run that created this checkpoint."""
-    delta_updates_since_snapshot: dict[str, int]
-    """Per-channel update count since the last `_DeltaSnapshot` was written.
+    counters_since_delta_snapshot: dict[str, tuple[int, int]]
+    """Per-channel counters since the last `_DeltaSnapshot` was written.
 
     !!! warning "Beta"
 
         This metadata field backs `DeltaChannel` (beta). The key name and
         contents may change while the delta-channel design stabilizes.
 
-    Maps channel name → number of supersteps that wrote to this channel
-    since its last snapshot blob. Used by `pregel.create_checkpoint` to
-    decide when to write the next snapshot (when the count reaches the
-    channel's `snapshot_frequency`, snapshot fires and the count resets
-    to 0). Absent on threads that don't use delta channels. Version-format
-    independent — works for int, float, and string version schemes.
+    Maps channel name -> `(updates, supersteps)`:
+
+    - index 0 (`updates`): number of supersteps that wrote to this channel
+      since its last snapshot blob.
+    - index 1 (`supersteps`): total supersteps elapsed since this channel's
+      last snapshot, regardless of whether the channel was written.
+
+    A snapshot fires when EITHER `updates >= ch.snapshot_frequency` OR
+    `supersteps >= DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT` (system-wide bound,
+    default 5000, env `LANGGRAPH_DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT`).
+    The supersteps bound prevents unbounded ancestor walks on threads where
+    a delta channel exists but is no longer being updated.
+
+    Absent on threads that don't use delta channels. Persisted as a
+    2-element list in JSON (no native tuple).
     """
 
 
@@ -152,6 +162,14 @@ class DeltaChannelHistory(TypedDict):
       Always present; possibly empty. Already filtered to one channel.
       Writes stored at the target checkpoint itself are pending for the
       next super-step and are excluded.
+
+      Within a single checkpoint, writes are ordered by `writes_sort_key`,
+      `(task_path, task_id, idx)`, which is the order live execution applies
+      a super-step's task writes in. `task_id` is a hash of the path, so
+      ordering by it permutes parallel tasks writing one channel, and
+      reducers need not be order-invariant. Writes stored without a
+      `task_path` (graph input, `update_state` and `Command` updates, rows
+      predating the column) sort first, by `task_id`.
     * `seed` — the stored value at the nearest ancestor whose
       `channel_values[ch]` is populated. Omitted if the walk reached the
       root without finding any stored value (consumer treats absence as
@@ -162,6 +180,20 @@ class DeltaChannelHistory(TypedDict):
 
     writes: list[PendingWrite]
     seed: NotRequired[Any]
+
+
+def writes_sort_key(
+    task_path: str, task_id: str = "", idx: int = 0
+) -> tuple[str, str, int]:
+    """Sort key for the writes of one super-step.
+
+    Live execution applies a super-step's tasks in this order, so a saver
+    that replays stored writes, as `get_delta_channel_history` does, must
+    sort them by it too, or an order-sensitive reducer rebuilds a different
+    value than the run produced. `task_path` is the string passed to
+    `put_writes`.
+    """
+    return (task_path, task_id, idx)
 
 
 class BaseCheckpointSaver(Generic[V]):
@@ -234,7 +266,8 @@ class BaseCheckpointSaver(Generic[V]):
             config: Configuration specifying which checkpoint to retrieve.
 
         Returns:
-            The requested checkpoint tuple, or `None` if not found.
+            The requested checkpoint tuple, or `None` if not found. Its
+                `pending_writes` must be in `writes_sort_key` order.
 
         Raises:
             NotImplementedError: Implement this method in your custom checkpoint saver.
@@ -327,6 +360,14 @@ class BaseCheckpointSaver(Generic[V]):
 
         Args:
             run_ids: The run IDs whose checkpoints should be deleted.
+
+        !!! warning "DeltaChannel"
+
+            Deleting a run that produced ancestor `checkpoint_writes` — or
+            the only `_DeltaSnapshot` blob — for a still-live thread will
+            break reconstruction of any `DeltaChannel` whose history
+            depended on those rows. See the `DeltaChannel` note on `prune`
+            for safe-recovery strategies.
         """
         raise NotImplementedError
 
@@ -340,6 +381,17 @@ class BaseCheckpointSaver(Generic[V]):
         Args:
             source_thread_id: The thread ID to copy from.
             target_thread_id: The thread ID to copy to.
+
+        !!! warning "DeltaChannel"
+
+            Implementations must copy the **complete** parent chain (all
+            ancestor checkpoints and their `checkpoint_writes`) — copying
+            only the head checkpoint will leave the target thread with
+            `DeltaChannel` state that cannot be reconstructed (no path back
+            to a `_DeltaSnapshot` ancestor). Equivalently, the copy must
+            include enough ancestors that every `DeltaChannel`-backed key
+            has either a `_DeltaSnapshot` in `channel_values` somewhere in
+            the chain, or a complete write history back to the chain root.
         """
         raise NotImplementedError
 
@@ -355,6 +407,34 @@ class BaseCheckpointSaver(Generic[V]):
             thread_ids: The thread IDs to prune.
             strategy: The pruning strategy. `"keep_latest"` retains only the most
                 recent checkpoint per namespace. `"delete"` removes all checkpoints.
+
+        !!! warning "DeltaChannel"
+
+            Custom implementations must be `DeltaChannel`-aware. `DeltaChannel`
+            stores only a sentinel in `channel_values` for non-snapshot steps;
+            reconstruction walks the parent chain via
+            `get_delta_channel_history`, accumulating rows from
+            `checkpoint_writes` until it reaches an ancestor whose
+            `channel_values` contains a `_DeltaSnapshot` blob (written every
+            `snapshot_frequency` updates).
+
+            A naive `"keep_latest"` that drops intermediate checkpoints and
+            their writes can sever that chain: the surviving "latest"
+            checkpoint is rarely a snapshot point itself, so its delta
+            channels would silently reconstruct as empty (no error raised —
+            `get_delta_channel_history` simply returns no `seed`). Safe
+            options when the graph uses `DeltaChannel`:
+
+            * Walk back from each kept checkpoint and preserve every
+              ancestor (plus its `checkpoint_writes`) up to the nearest one
+              whose `channel_values` already contains a `_DeltaSnapshot` for
+              every `DeltaChannel`-backed key.
+            * Force a fresh snapshot on the kept checkpoint before deleting
+              ancestors — rewrite `channel_values[k] = _DeltaSnapshot(value)`
+              for each delta channel `k` (resolving `value` via the existing
+              ancestor walk first), then prune.
+            * Skip pruning threads whose graph uses `DeltaChannel` until one
+              of the above is implemented.
         """
         raise NotImplementedError
 
@@ -377,7 +457,8 @@ class BaseCheckpointSaver(Generic[V]):
             config: Configuration specifying which checkpoint to retrieve.
 
         Returns:
-            The requested checkpoint tuple, or `None` if not found.
+            The requested checkpoint tuple, or `None` if not found. Its
+                `pending_writes` must be in `writes_sort_key` order.
 
         Raises:
             NotImplementedError: Implement this method in your custom checkpoint saver.
@@ -471,6 +552,13 @@ class BaseCheckpointSaver(Generic[V]):
 
         Args:
             run_ids: The run IDs whose checkpoints should be deleted.
+
+        !!! warning "DeltaChannel"
+
+            See `delete_for_runs` — deleting rows a still-live thread's
+            `DeltaChannel` reconstruction depends on (writes between the
+            head and its nearest `_DeltaSnapshot` ancestor) will silently
+            corrupt that channel's state.
         """
         raise NotImplementedError
 
@@ -484,6 +572,13 @@ class BaseCheckpointSaver(Generic[V]):
         Args:
             source_thread_id: The thread ID to copy from.
             target_thread_id: The thread ID to copy to.
+
+        !!! warning "DeltaChannel"
+
+            See `copy_thread` — the copy must carry the complete parent
+            chain (or at least back to a `_DeltaSnapshot` ancestor for every
+            `DeltaChannel`) so the target thread can reconstruct delta
+            state.
         """
         raise NotImplementedError
 
@@ -499,6 +594,13 @@ class BaseCheckpointSaver(Generic[V]):
             thread_ids: The thread IDs to prune.
             strategy: The pruning strategy. `"keep_latest"` retains only the most
                 recent checkpoint per namespace. `"delete"` removes all checkpoints.
+
+        !!! warning "DeltaChannel"
+
+            See `prune` for the full `DeltaChannel` caveat. In short:
+            `"keep_latest"` must not drop ancestor checkpoints / writes that
+            sit between the kept checkpoint and the nearest `_DeltaSnapshot`
+            ancestor, or delta channels will silently reconstruct as empty.
         """
         raise NotImplementedError
 
@@ -532,6 +634,10 @@ class BaseCheckpointSaver(Generic[V]):
         channel. Savers with direct storage access (`InMemorySaver`,
         `PostgresSaver`) override for performance; the return contract is
         fixed here.
+
+        `PendingWrite` carries no `task_path`, so this default replays each
+        checkpoint's writes in `get_tuple`'s `pending_writes` order, which
+        `get_tuple` must return in `writes_sort_key` order.
 
         Args:
             config: Configuration identifying the target checkpoint.
@@ -704,7 +810,7 @@ def get_serializable_checkpoint_metadata(
     """Get checkpoint metadata in a backwards-compatible manner."""
     checkpoint_metadata = get_checkpoint_metadata(config, metadata)
     if "writes" in checkpoint_metadata:
-        checkpoint_metadata.pop("writes")
+        cast(dict[str, Any], checkpoint_metadata).pop("writes")
     return checkpoint_metadata
 
 

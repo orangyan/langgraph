@@ -7,7 +7,7 @@ from typing import Any, Literal
 from warnings import warn
 
 # EmptyChannelError is re-exported from langgraph.channels.base
-from langgraph.checkpoint.base import EmptyChannelError  # noqa: F401
+from langgraph.checkpoint.base import EmptyChannelError
 from typing_extensions import deprecated
 
 from langgraph.types import Command, Interrupt
@@ -21,12 +21,14 @@ __all__ = (
     "InvalidUpdateError",
     "GraphBubbleUp",
     "GraphInterrupt",
+    "NodeCancelledError",
     "NodeError",
     "NodeInterrupt",
     "NodeTimeoutError",
     "ParentCommand",
     "EmptyInputError",
     "TaskNotFound",
+    "is_invalid_resume",
 )
 
 
@@ -164,6 +166,28 @@ class NodeError:
     """Exception raised by the failed node."""
 
 
+class NodeCancelledError(Exception):
+    """Raised when a node body raises ``asyncio.CancelledError`` itself.
+
+    ``asyncio.CancelledError`` is a ``BaseException`` and the pregel runner
+    treats cancelled task futures as silent tear-down (e.g. when it stops
+    sibling tasks after a peer fails). That is the correct behaviour for
+    *framework-initiated* cancellation, but a user node that raises
+    ``asyncio.CancelledError`` from its own body should surface as a node
+    failure, the same way any other exception would.
+
+    The retry layer converts user-raised ``asyncio.CancelledError`` into this
+    type so it flows through the normal error path and the run reports as
+    ``error`` instead of silently succeeding.
+    """
+
+    node: str
+
+    def __init__(self, node: str, message: str | None = None) -> None:
+        super().__init__(message or f"Node {node!r} raised asyncio.CancelledError")
+        self.node = node
+
+
 class NodeTimeoutError(Exception):
     """Raised when a node invocation exceeds one of its configured timeouts.
 
@@ -216,3 +240,21 @@ class NodeTimeoutError(Exception):
         self.kind = kind
         self.idle_timeout = idle_timeout
         self.run_timeout = run_timeout
+
+
+_INVALID_RESUME = "_langgraph_invalid_resume"
+
+
+def _mark_invalid_resume(error: BaseException) -> None:
+    setattr(error, _INVALID_RESUME, True)
+
+
+def is_invalid_resume(error: BaseException) -> bool:
+    """Whether `error` was raised because a resume value didn't match `response_schema`.
+
+    `interrupt()` raises a `pydantic.ValidationError` in that case. `ToolNode` uses
+    this to tell it apart from invalid tool arguments when a tool calls `interrupt()`
+    or runs a graph that does, so the resume fails and the interrupt can be answered
+    again.
+    """
+    return getattr(error, _INVALID_RESUME, False) is True

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from langchain_core._api import beta
 
@@ -12,7 +12,13 @@ from langgraph.stream._mux import StreamMux
 from langgraph.stream._types import ProtocolEvent
 
 if TYPE_CHECKING:
-    from langgraph.stream.transformers import SubgraphStatus
+    from langchain_core.language_models.chat_model_stream import (
+        AsyncChatModelStream,
+        ChatModelStream,
+    )
+
+    from langgraph.stream.stream_channel import StreamChannel
+    from langgraph.stream.transformers import LifecyclePayload, SubgraphStatus
 
 
 def _drive_until_done(pump: Callable[[], bool]) -> None:
@@ -25,6 +31,26 @@ async def _adrive_until_done(pump: Callable[[], Awaitable[bool]]) -> None:
     """Call the async pump until it returns False."""
     while await pump():
         pass
+
+
+def _raise_missing_projection(run: object, name: str) -> NoReturn:
+    """Raise after normal attribute lookup fails for a projection.
+
+    Registered native projections are installed directly on the run instance
+    during `__init__`, so `__getattr__` is never called for them. At this point
+    the requested name is necessarily missing; the mux is inspected only to
+    include the valid registered projection names in the error message.
+
+    Read `_mux` directly from `__dict__` because it may not exist yet on a
+    partially initialized instance. Accessing `run._mux` in that case would
+    invoke `__getattr__` again and recurse indefinitely.
+    """
+    mux = run.__dict__.get("_mux")
+    registered = sorted(mux.native_keys) if mux is not None else []
+    raise AttributeError(
+        f"{type(run).__name__!r} object has no attribute {name!r} "
+        f"(registered projections: {', '.join(registered) or 'none'})"
+    )
 
 
 @beta(message="The v3 streaming protocol on Pregel is experimental.")
@@ -47,6 +73,33 @@ class GraphRunStream:
         Returned by `Pregel.stream_events(version="v3")`, which is
         experimental and may change.
     """
+
+    # Native projections, attached dynamically by the `setattr` loop in
+    # `__init__` and declared here so type checkers see them.
+    #
+    # Always registered by `stream_events(version="v3")`:
+    values: StreamChannel[dict[str, Any]]
+    messages: StreamChannel[ChatModelStream]
+    lifecycle: StreamChannel[LifecyclePayload]
+    subgraphs: StreamChannel[SubgraphRunStream]
+    # Registered on demand via `compile(transformers=...)` or
+    # `stream_events(transformers=...)`; reading one whose transformer was not
+    # registered raises AttributeError. Projections contributed by transformers
+    # outside this package are covered by `__getattr__` instead.
+    updates: StreamChannel[dict[str, Any]]
+    custom: StreamChannel[Any]
+    checkpoints: StreamChannel[dict[str, Any]]
+    debug: StreamChannel[dict[str, Any]]
+    tasks: StreamChannel[dict[str, Any]]
+
+    def __getattr__(self, name: str) -> StreamChannel[Any]:
+        """Type the projections of transformers declared outside this package.
+
+        Projection names come from a registry, so no annotation here can name
+        them all. The cost is that a misspelling type-checks too, and fails at
+        runtime instead.
+        """
+        _raise_missing_projection(self, name)
 
     def __init__(
         self,
@@ -132,13 +185,23 @@ class GraphRunStream:
     def abort(self) -> None:
         """Stop the run early.
 
-        Closes the mux and marks the stream exhausted. The graph
-        iterator is dropped; any in-flight nodes see the closure on
-        their next yield point. Idempotent.
+        Closes the underlying graph iterator (propagating `GeneratorExit`
+        so in-flight nodes and subgraphs are cancelled), closes the mux,
+        and marks the stream exhausted. Idempotent.
         """
         if self._exhausted:
             return
         self._exhausted = True
+        graph_iter = self._graph_iter
+        self._graph_iter = None
+        if (
+            graph_iter is not None
+            and (close := getattr(graph_iter, "close", None)) is not None
+        ):
+            try:
+                close()
+            except Exception:
+                pass
         try:
             self._mux.close()
         except Exception:
@@ -319,6 +382,25 @@ class AsyncGraphRunStream:
         experimental and may change.
     """
 
+    # Native projections, attached dynamically by the `setattr` loop in
+    # `__init__` and declared here so type checkers see them.
+    #
+    # Always registered by `astream_events(version="v3")`:
+    values: StreamChannel[dict[str, Any]]
+    messages: StreamChannel[AsyncChatModelStream]
+    lifecycle: StreamChannel[LifecyclePayload]
+    subgraphs: StreamChannel[AsyncSubgraphRunStream]
+    # Registered on demand; see `GraphRunStream`.
+    updates: StreamChannel[dict[str, Any]]
+    custom: StreamChannel[Any]
+    checkpoints: StreamChannel[dict[str, Any]]
+    debug: StreamChannel[dict[str, Any]]
+    tasks: StreamChannel[dict[str, Any]]
+
+    def __getattr__(self, name: str) -> StreamChannel[Any]:
+        """Type projections declared elsewhere. See `GraphRunStream`."""
+        _raise_missing_projection(self, name)
+
     def __init__(
         self,
         graph_aiter: AsyncIterator[Any] | None,
@@ -348,6 +430,8 @@ class AsyncGraphRunStream:
         self._scope_list: list[str] = list(mux.scope)
         self._pump_cond = asyncio.Condition()
         self._pumping = False
+        self._anext_task: asyncio.Future[Any] | None = None
+        self._aborting = False
         for key in mux.native_keys:
             setattr(self, key, mux.extensions[key])
         if wire_pump:
@@ -407,7 +491,25 @@ class AsyncGraphRunStream:
 
         try:
             try:
-                part = await self._graph_aiter.__anext__()
+                # Run the pull as a child task so `abort()` can cancel it
+                # mid-flight. Cancelling propagates `CancelledError` into the
+                # graph generator frame -> Pregel loop -> nested subgraph
+                # nodes, which a bare `aclose()` cannot do while the generator
+                # is running ("asynchronous generator is already running").
+                self._anext_task = asyncio.ensure_future(self._graph_aiter.__anext__())
+                try:
+                    part = await self._anext_task
+                except asyncio.CancelledError:
+                    if self._aborting:
+                        # Abort-initiated cancel: stop gracefully.
+                        self._exhausted = True
+                        return False
+                    # Genuine external cancel of this task: also stop the
+                    # in-flight pull, then propagate.
+                    self._anext_task.cancel()
+                    raise
+                finally:
+                    self._anext_task = None
                 event = convert_to_protocol_event(part)
                 self._observe_event(event)
                 await self._mux.apush(event)
@@ -428,15 +530,40 @@ class AsyncGraphRunStream:
     async def abort(self) -> None:
         """Stop the run early.
 
-        Marks the stream exhausted, wakes any pump-waiters, and closes
-        the mux. Any `apush` blocked on backpressure wakes and returns
-        without appending. Idempotent.
+        Marks the stream exhausted and wakes any pump-waiters. Cancels an
+        in-flight pull if one is running, then closes the underlying graph
+        iterator, so running nodes and nested subgraphs are cancelled
+        whether or not a pump is mid-pull. Closes the mux; any `apush`
+        blocked on backpressure wakes and returns without appending.
+        Idempotent.
         """
         async with self._pump_cond:
             if self._exhausted:
                 return
             self._exhausted = True
+            self._aborting = True
+            graph_aiter = self._graph_aiter
+            self._graph_aiter = None
+            anext_task = self._anext_task
             self._pump_cond.notify_all()
+        # If a pump is mid-pull, cancel it so the cancellation propagates
+        # into running nodes and nested subgraphs. Once it settles the
+        # generator is no longer running, so the `aclose()` below is a safe
+        # final cleanup (and handles the no-in-flight-pull case directly).
+        if anext_task is not None and not anext_task.done():
+            anext_task.cancel()
+            try:
+                await anext_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if (
+            graph_aiter is not None
+            and (aclose := getattr(graph_aiter, "aclose", None)) is not None
+        ):
+            try:
+                await aclose()
+            except Exception:
+                pass
         try:
             await self._mux.aclose()
         except Exception:

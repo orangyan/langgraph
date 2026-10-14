@@ -6,9 +6,11 @@ from typing import Any
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.memory import InMemoryStore
 from pydantic import BaseModel, ValidationError
 from typing_extensions import TypedDict
 
+from langgraph._internal._constants import CONFIG_KEY_RUNTIME
 from langgraph.errors import GraphDrained
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import (
@@ -244,6 +246,95 @@ def test_drain_from_subgraph_can_resume_parent() -> None:
         "child_second": "done",
         "parent_second": "done",
     }
+
+
+class _BreakpointState(TypedDict, total=False):
+    first: str
+    second: str
+
+
+def _drain_before_breakpoint_builder(
+    second_runs: list[str],
+) -> StateGraph[_BreakpointState]:
+    def first(state: _BreakpointState, runtime: Runtime) -> _BreakpointState:
+        runtime.control.request_drain("rollout")
+        return {"first": "done"}
+
+    def second(state: _BreakpointState) -> _BreakpointState:
+        second_runs.append("second")
+        return {"second": "done"}
+
+    builder = StateGraph(_BreakpointState)
+    builder.add_node("first", first)
+    builder.add_node("second", second)
+    builder.add_edge(START, "first")
+    builder.add_edge("first", "second")
+    return builder
+
+
+@pytest.mark.parametrize("at_compile", [True, False])
+def test_drain_before_interrupt_before_stops_at_breakpoint(at_compile: bool) -> None:
+    # A resume passes the next step's breakpoints, so a drain right before a
+    # breakpoint has to stop there instead, or the resumed run skips it.
+    second_runs: list[str] = []
+    breakpoints = {"interrupt_before": ["second"]}
+    compiled = _drain_before_breakpoint_builder(second_runs).compile(
+        checkpointer=MemorySaver(), **(breakpoints if at_compile else {})
+    )
+    run_kwargs = {} if at_compile else breakpoints
+    config = {"configurable": {"thread_id": "drain-breakpoint"}}
+
+    assert compiled.invoke({}, config, control=RunControl(), **run_kwargs) == {
+        "first": "done"
+    }
+    assert compiled.get_state(config).next == ("second",)
+    assert second_runs == []
+
+    assert compiled.invoke(None, config, **run_kwargs) == {
+        "first": "done",
+        "second": "done",
+    }
+    assert second_runs == ["second"]
+
+
+def test_drain_before_subgraph_interrupt_before_stops_at_breakpoint() -> None:
+    second_runs: list[str] = []
+    child = _drain_before_breakpoint_builder(second_runs).compile(
+        interrupt_before=["second"]
+    )
+    parent = StateGraph(_BreakpointState)
+    parent.add_node("child", child)
+    parent.add_edge(START, "child")
+    compiled = parent.compile(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "drain-subgraph-breakpoint"}}
+
+    compiled.invoke({}, config, control=RunControl())
+    state = compiled.get_state(config, subgraphs=True)
+    assert state.next == ("child",)
+    assert state.tasks[0].state.next == ("second",)
+    assert second_runs == []
+
+    assert compiled.invoke(None, config) == {"first": "done", "second": "done"}
+    assert second_runs == ["second"]
+
+
+@pytest.mark.anyio
+async def test_drain_before_interrupt_before_stops_at_breakpoint_async() -> None:
+    second_runs: list[str] = []
+    compiled = _drain_before_breakpoint_builder(second_runs).compile(
+        checkpointer=MemorySaver(), interrupt_before=["second"]
+    )
+    config = {"configurable": {"thread_id": "drain-breakpoint-async"}}
+
+    assert await compiled.ainvoke({}, config, control=RunControl()) == {"first": "done"}
+    assert (await compiled.aget_state(config)).next == ("second",)
+    assert second_runs == []
+
+    assert await compiled.ainvoke(None, config) == {
+        "first": "done",
+        "second": "done",
+    }
+    assert second_runs == ["second"]
 
 
 @pytest.mark.anyio
@@ -1164,3 +1255,54 @@ def test_execution_info_inherited_by_subgraph() -> None:
     # task_id appears in its own namespace segment
     assert main_info.task_id in main_info.checkpoint_ns
     assert sub_info.task_id in sub_info.checkpoint_ns
+
+
+def test_foreign_object_in_runtime_slot_is_coerced() -> None:
+    """A non-`Runtime` under `CONFIG_KEY_RUNTIME` is adopted, not crashed on,
+    and the `context` it carries is plumbed through.
+
+    Layers outside a run (e.g. a server's graph-factory path, like LangGraph
+    API) seed an object carrying `context`/`store` into the runtime slot. The
+    run must still execute (regression for `AttributeError: '...' object has no
+    attribute 'control'`), and `context` set at that level must reach nodes via
+    `merge` when no per-run `context` is provided. `store` is resolved
+    separately, so it is not read off the foreign object in the coercion.
+    """
+
+    store = InMemoryStore()
+    graph_level_context = {"source": "graph-level"}
+
+    class _ServerLikeRuntime:
+        """Carries context/store but is not a `Runtime` (no control/merge)."""
+
+        def __init__(self) -> None:
+            self.context = graph_level_context
+            self.store = store
+
+    seen: dict[str, Any] = {}
+
+    class State(TypedDict, total=False):
+        text: str
+
+    def echo(state: State, runtime: Runtime) -> State:
+        seen["context"] = runtime.context
+        seen["store"] = runtime.store
+        return {"text": (state.get("text") or "") + " echoed"}
+
+    builder = StateGraph(State)
+    builder.add_node("echo", echo)
+    builder.add_edge(START, "echo")
+    builder.add_edge("echo", END)
+    graph = builder.compile()
+
+    # No per-run `context=`: the graph-level context on the slot must plumb through.
+    result = graph.invoke(
+        {"text": "hi"},
+        {"configurable": {CONFIG_KEY_RUNTIME: _ServerLikeRuntime()}},
+    )
+
+    assert result == {"text": "hi echoed"}
+    # context set at the graph level is plumbed through to the node via merge
+    assert seen["context"] == graph_level_context
+    # store still reaches the node (resolved separately, not via the coercion)
+    assert seen["store"] is store
